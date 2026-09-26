@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1
+# check=skip=FromPlatformFlagConstDisallowed
+# Cross-compile Vaultwarden for linux/riscv64
+# Builder stages run natively on the build host — no source patches
+# Usage: docker buildx build --platform linux/riscv64 --build-arg VW_VERSION=1.37.3 \
+#          -t vaultwarden:riscv64 -f Dockerfile.vaultwarden --load .
+
+ARG VW_VERSION=1.37.3
+# web-vault v2026.7.0 — the digest pinned by upstream docker/DockerSettings.yaml for VW_VERSION
+ARG WEB_VAULT_DIGEST=sha256:ba8bab66d4330ab9dbafa8f245bcbe99cf6ee3f2c8ce9b5fbb10e9c49658451c
+
+# Stage 0 — Upstream source (cloned once) + Rust version resolved from it
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS source
+ARG VW_VERSION
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /vaultwarden
+RUN git clone --depth=1 -b "${VW_VERSION}" \
+    https://github.com/dani-garcia/vaultwarden.git .
+
+# COPY is content-hashed: the toolchain layer stays cached until upstream bumps Rust
+RUN set -eu; mkdir -p /versions; \
+    rust=$(awk -F'"' '$1 ~ /^channel *=/ {print $2; exit}' rust-toolchain.toml); \
+    [ -n "$rust" ] || { echo "ERROR: cannot resolve rust version" >&2; exit 1; }; \
+    echo "$rust" > /versions/rust; echo "rust=$rust"
+
+# Stage 1 — Web vault: static files only, no RUN → nothing is executed
+FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@${WEB_VAULT_DIGEST} AS vault
+
+# Stage 2 — Rust cross-compile for riscv64 (gcc-riscv64-linux-gnu + riscv64 multiarch -dev libs)
+# Host gcc is still needed: build scripts and proc-macros run on the build host
+# trixie: riscv64 is an official Debian release architecture
+FROM --platform=$BUILDPLATFORM debian:trixie AS build
+
+RUN dpkg --add-architecture riscv64 && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git pkg-config \
+    gcc libc6-dev \
+    gcc-riscv64-linux-gnu libc6-dev-riscv64-cross \
+    libssl-dev:riscv64 libpq-dev:riscv64 libmariadb-dev:riscv64 zlib1g-dev:riscv64 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    CARGO_BUILD_TARGET=riscv64gc-unknown-linux-gnu \
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc \
+    CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc \
+    AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_LIBDIR=/usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,-rpath-link,/usr/lib/riscv64-linux-gnu"
+
+COPY --from=source /versions/rust /versions/rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain "$(cat /versions/rust)" \
+        --target riscv64gc-unknown-linux-gnu
+
+COPY --from=source /vaultwarden /vaultwarden
+WORKDIR /vaultwarden
+
+# Same DB backends as the official image; SQLite is bundled (statically linked).
+# RUSTUP_TOOLCHAIN overrides rust-toolchain.toml, which would also pull rustfmt/clippy.
+ARG VW_VERSION
+ARG DB=sqlite,mysql,postgresql
+RUN export RUSTUP_TOOLCHAIN="$(cat /versions/rust)" && \
+    VW_VERSION="${VW_VERSION}" \
+    cargo build --locked --release --features "${DB}" && \
+    mkdir -p /out && \
+    cp target/riscv64gc-unknown-linux-gnu/release/vaultwarden /out/vaultwarden
+
+# Stage 3 — Final image: same runtime as upstream Dockerfile.debian, riscv64 userland.
+# The only RUN here is apt-get (runs under QEMU, ~1-2 min); all compilation happened above.
+FROM --platform=linux/riscv64 debian:trixie-slim
+
+ENV ROCKET_PROFILE="release" \
+    ROCKET_ADDRESS=0.0.0.0 \
+    ROCKET_PORT=80 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN mkdir /data && \
+    apt-get update && apt-get install -y \
+        --no-install-recommends \
+        ca-certificates \
+        curl \
+        libmariadb3 \
+        libpq5 \
+        openssl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+VOLUME /data
+EXPOSE 80
+
+WORKDIR /
+
+COPY --from=source /vaultwarden/docker/healthcheck.sh /vaultwarden/docker/start.sh /
+COPY --from=vault /web-vault ./web-vault
+COPY --from=build /out/vaultwarden .
+
+HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
+
+CMD ["/start.sh"]

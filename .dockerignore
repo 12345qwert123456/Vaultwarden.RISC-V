@@ -1,0 +1,9 @@
+.git
+.github
+*.md
+*.tar
+*.tar.gz
+*.bin
+.gitignore
+.gitattributes
+LICENSE

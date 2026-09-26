@@ -1,0 +1,180 @@
+name: Build Vaultwarden for RISC-V 64
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # daily at 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+      version:
+        description: 'Override version (e.g. 1.37.3). Leave empty for latest.'
+        type: string
+        default: ''
+
+env:
+  IMAGE_NAME: vaultwarden
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/vaultwarden-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      web_vault_digest: ${{ steps.resolve.outputs.web_vault_digest }}
+      web_vault_version: ${{ steps.resolve.outputs.web_vault_version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(curl -sL https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest \
+              | jq -r '.tag_name')
+          fi
+
+          # docker/DockerSettings.yaml at that tag pins the web-vault image upstream ships with it
+          SETTINGS=$(curl -sfL "https://raw.githubusercontent.com/dani-garcia/vaultwarden/${VERSION}/docker/DockerSettings.yaml")
+          DIGEST=$(echo "$SETTINGS" | sed -n 's/^vault_image_digest: *"\(sha256:[0-9a-f]*\)".*/\1/p')
+          VAULT=$(echo "$SETTINGS" | sed -n 's/^vault_version: *"\([^"]*\)".*/\1/p')
+          [[ -n "$DIGEST" ]] || { echo "ERROR: cannot resolve web-vault digest"; exit 1; }
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "web_vault_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "web_vault_version=${VAULT}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Vaultwarden ${VERSION}, web-vault ${VAULT} (${DIGEST})"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          FORCE="${{ inputs.force }}"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          EXISTING=$(gh release view "${VERSION}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${VERSION}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${VERSION}-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Only the final stage's apt-get and the smoke test run riscv64 code;
+      # the Rust build is cross-compiled natively on the runner.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.vaultwarden
+          platforms: linux/riscv64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64
+          build-args: |
+            VW_VERSION=${{ env.VERSION }}
+            WEB_VAULT_DIGEST=${{ needs.detect.outputs.web_vault_digest }}
+
+      - name: Extract and verify
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64"
+          docker inspect "$IMG" --format '{{.Architecture}}' | grep -qx 'riscv64' \
+            || { echo "ERROR: image is not riscv64"; exit 1; }
+
+          docker create --platform linux/riscv64 --name extract "$IMG"
+          docker cp extract:/vaultwarden ./vaultwarden
+          docker cp extract:/web-vault ./web-vault
+          docker rm extract
+
+          file ./vaultwarden
+          file ./vaultwarden | grep -q "RISC-V" || { echo "ERROR: vaultwarden is not a RISC-V binary"; exit 1; }
+          test -f ./web-vault/index.html || { echo "ERROR: web-vault missing"; exit 1; }
+
+          # Runs the binary under QEMU against the image's own libraries
+          docker run --rm --platform linux/riscv64 --entrypoint /vaultwarden "$IMG" --version \
+            | tee /dev/stderr | grep -q "${{ env.VERSION }}"
+
+          tar czf vaultwarden-${{ env.VERSION }}-linux-riscv64-bin.tar.gz vaultwarden web-vault
+          sha256sum vaultwarden-${{ env.VERSION }}-linux-riscv64-bin.tar.gz > SHA256SUMS
+          ls -lh vaultwarden vaultwarden-${{ env.VERSION }}-linux-riscv64-bin.tar.gz
+
+      - name: Login to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.VERSION }}-riscv64 \
+            ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.VERSION }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "Vaultwarden ${{ env.VERSION }} for RISC-V 64" \
+            --notes "Cross-compiled [Vaultwarden ${{ env.VERSION }}](https://github.com/dani-garcia/vaultwarden/releases/tag/${{ env.VERSION }}) for linux/riscv64.
+
+          Web vault: \`${{ needs.detect.outputs.web_vault_version }}\` (same as upstream image).
+          Features: \`sqlite\` (bundled), \`mysql\`, \`postgresql\`.
+
+          **Binary + web-vault (standalone, Debian trixie / glibc):**
+          \`\`\`bash
+          sudo apt install libpq5 libmariadb3 libssl3t64
+          tar xzf vaultwarden-${{ env.VERSION }}-linux-riscv64-bin.tar.gz
+          ./vaultwarden
+          \`\`\`
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          \`\`\`
+
+          Built from upstream source without patches." \
+            vaultwarden-${{ env.VERSION }}-linux-riscv64-bin.tar.gz \
+            SHA256SUMS

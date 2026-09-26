@@ -1,0 +1,21 @@
+# Build artifacts
+*.tar
+*.tar.gz
+*.bin
+/vaultwarden
+/web-vault/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+*.log
